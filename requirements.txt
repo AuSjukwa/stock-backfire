@@ -1,7 +1,7 @@
 # A股回测平台依赖 — 版本固定，避免接口漂移
 akshare==1.17.16
 backtrader==1.9.78.123
-streamlit==1.41.1
+streamlit==1.46.0
 quantstats==0.0.64
 pandas==2.2.3
 numpy==1.26.4
