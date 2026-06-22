@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "Glob",
+      "Grep",
+      "LS",
+      "Bash",
+      "Bash(git commit*)",
+      "mcp__chrome-devtools__*",
+      "mcp__mysql-mcp__mysql_query"
+    ],
+    "deny": [
+      "Read(node_modules)",
+      "Bash(git push*)"
+    ]
+  },
+  "worktree": {
+    "baseRef": "head"
+  },
+  "enabledPlugins": {
+    "everything-claude-code@everything-claude-code": false,
+    "superpowers@claude-plugins-official": true
+  },
+  "enabledMcpjsonServers": [
+    "mysql-mcp",
+    "chrome-devtools"
+  ],
+  "disabledMcpjsonServers": [
+    "playwright"
+  ]
+}

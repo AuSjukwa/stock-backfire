@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- 虚拟环境（绝不上传）----
+.venv/
+venv/
+env/
+
+# ---- 测试 / 工具缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Streamlit 机密（口令等，绝不上传）----
+.streamlit/secrets.toml
+
+# ---- 数据缓存 ----
+# 默认保留 data/cache 下的 parquet 作为部署兜底数据；
+# 如不想上传缓存，取消下一行注释即可。
+# data/cache/
+
+# ---- 操作系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

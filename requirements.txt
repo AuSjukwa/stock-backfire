@@ -1,0 +1,12 @@
+# A股回测平台依赖 — 版本固定，避免接口漂移
+akshare==1.17.16
+backtrader==1.9.78.123
+streamlit==1.41.1
+quantstats==0.0.64
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==18.1.0
+plotly==5.24.1
+matplotlib==3.9.4
+ipython==8.31.0
+pytest==8.3.4
