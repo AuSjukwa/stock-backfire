@@ -12,6 +12,8 @@ build_snapshot() 负责抓数 + 组装；compute_row_metrics() 是纯函数，�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -22,6 +24,26 @@ from .monitor_sources import MonitorItem
 
 MA_WINDOW = 20
 VOL_WINDOW = 5
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+US_EASTERN_TZ = ZoneInfo("America/New_York")
+
+# 以下窗口均为 Sina 行情返回的北京时间，不做市场本地时区转换。
+_MARKET_WINDOWS_BEIJING: dict[str, list[tuple[time, time]]] = {
+    "a_index": [(time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))],
+    "hk_index": [(time(9, 30), time(12, 0)), (time(13, 0), time(16, 0))],
+    "sge_spot": [
+        (time(9, 0), time(11, 30)),
+        (time(13, 30), time(15, 30)),
+        (time(20, 0), time(23, 59, 59)),
+        (time(0, 0), time(2, 30)),
+    ],
+}
+
+_GLOBAL_INDEX_WINDOWS_BEIJING: dict[str, list[tuple[time, time]]] = {
+    "日经225指数": [(time(8, 0), time(10, 30)), (time(11, 30), time(14, 30))],
+    "首尔综合指数": [(time(8, 0), time(14, 30))],
+    "中国台湾加权指数": [(time(9, 0), time(13, 30))],
+}
 
 
 @dataclass
@@ -36,8 +58,64 @@ class RowMetrics:
     above_ma: bool
 
 
+def _parse_quote_datetime(quote_date: str, quote_time: str) -> datetime | None:
+    try:
+        date_part = datetime.strptime(quote_date, "%Y-%m-%d").date()
+        time_part = datetime.strptime(quote_time, "%H:%M:%S").time()
+    except (TypeError, ValueError):
+        return None
+    return datetime.combine(date_part, time_part, tzinfo=BEIJING_TZ)
+
+
+def _time_in_windows(value: time, windows: list[tuple[time, time]]) -> bool:
+    for start, end in windows:
+        if start <= end:
+            if start <= value <= end:
+                return True
+        elif value >= start or value <= end:
+            return True
+    return False
+
+
+def is_market_open(
+    source: str,
+    item_symbol: str,
+    quote_date: str,
+    quote_time: str,
+    now_beijing: datetime,
+) -> bool:
+    """按行情源北京时间判断该报价是否处在交易时段内。"""
+    quote_dt = _parse_quote_datetime(quote_date, quote_time)
+    if quote_dt is None:
+        return False
+
+    current_beijing = (
+        now_beijing.replace(tzinfo=BEIJING_TZ)
+        if now_beijing.tzinfo is None
+        else now_beijing.astimezone(BEIJING_TZ)
+    )
+    if quote_dt.date() != current_beijing.date():
+        return False
+
+    if source == "us_index":
+        eastern_dt = quote_dt.astimezone(US_EASTERN_TZ)
+        return (
+            eastern_dt.weekday() < 5
+            and time(9, 30) <= eastern_dt.time() <= time(16, 0)
+        )
+
+    windows = (
+        _GLOBAL_INDEX_WINDOWS_BEIJING.get(item_symbol, [])
+        if source == "global_index"
+        else _MARKET_WINDOWS_BEIJING.get(source, [])
+    )
+    return _time_in_windows(quote_dt.time(), windows)
+
+
 def compute_row_metrics(df: pd.DataFrame, asof: pd.Timestamp | None = None,
-                        ma_window: int = MA_WINDOW, vol_window: int = VOL_WINDOW) -> RowMetrics:
+                        ma_window: int = MA_WINDOW, vol_window: int = VOL_WINDOW,
+                        realtime_price: float | None = None,
+                        realtime_date: str | pd.Timestamp | None = None) -> RowMetrics:
     """从单标的日线计算监控指标。df 需含 date/open/high/low/close/volume，按日期升序。"""
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
@@ -49,6 +127,24 @@ def compute_row_metrics(df: pd.DataFrame, asof: pd.Timestamp | None = None,
 
     d["ma"] = d["close"].rolling(ma_window).mean()
     d = d.dropna(subset=["ma"]).reset_index(drop=True)
+    d_daily = d.copy()
+
+    vol_ratio: float | None = None
+    if d["volume"].notna().any():
+        vols = d["volume"].astype(float)
+        if len(vols) > vol_window and vols.iloc[-vol_window - 1:-1].mean() > 0:
+            vol_ratio = float(vols.iloc[-1] / vols.iloc[-vol_window - 1:-1].mean())
+
+    if realtime_price is not None and realtime_date is not None and np.isfinite(realtime_price):
+        rt_date = pd.to_datetime(realtime_date)
+        last_daily_date = d["date"].iloc[-1]
+        if rt_date > last_daily_date:
+            # 盘中只把实时价作为额外比较点，MA20 沿用最新日线收盘均线。
+            realtime_row = d.iloc[[-1]].copy()
+            realtime_row.loc[:, "date"] = rt_date
+            realtime_row.loc[:, "close"] = float(realtime_price)
+            realtime_row.loc[:, "ma"] = float(d["ma"].iloc[-1])
+            d = pd.concat([d, realtime_row], ignore_index=True)
 
     price = float(d["close"].iloc[-1])
     ma20 = float(d["ma"].iloc[-1])
@@ -57,25 +153,19 @@ def compute_row_metrics(df: pd.DataFrame, asof: pd.Timestamp | None = None,
     bias_pct = (price - ma20) / ma20 * 100 if ma20 else 0.0
     above_ma = price >= ma20
 
-    # 量比：今日量 / 过去 vol_window 日均量（不含今日）
-    vol_ratio: float | None = None
-    if d["volume"].notna().any():
-        vols = d["volume"].astype(float)
-        if len(vols) > vol_window and vols.iloc[-vol_window - 1:-1].mean() > 0:
-            vol_ratio = float(vols.iloc[-1] / vols.iloc[-vol_window - 1:-1].mean())
-
-    # 状态转变：价格相对 MA 的上方/下方布尔序列，找最近一次翻转
-    above_series = d["close"] >= d["ma"]
+    # 状态转变和区间涨幅只看日线收盘，盘中实时价不参与。
+    above_series = d_daily["close"] >= d_daily["ma"]
     flip = above_series != above_series.shift(1)
     flip.iloc[0] = False
-    flip_idx = d.index[flip]
+    flip_idx = d_daily.index[flip]
     state_change_date = None
     range_pct = None
     if len(flip_idx) > 0:
         last_flip = flip_idx[-1]
-        state_change_date = d["date"].iloc[last_flip]
-        base = float(d["close"].iloc[last_flip])
-        range_pct = (price / base - 1) * 100 if base else None
+        state_change_date = d_daily["date"].iloc[last_flip]
+        base = float(d_daily["close"].iloc[last_flip])
+        daily_price = float(d_daily["close"].iloc[-1])
+        range_pct = (daily_price / base - 1) * 100 if base else None
 
     return RowMetrics(
         price=price, ma20=ma20, change_pct=change_pct, bias_pct=bias_pct,
@@ -101,6 +191,7 @@ def build_snapshot(
     """
     watchlist = watchlist or ms.DEFAULT_WATCHLIST
     asof_ts = pd.to_datetime(asof) if asof is not None else None
+    now_beijing = datetime.now(BEIJING_TZ)
 
     rows: list[dict] = []
     prev_rows: list[dict] = []  # 上一交易日的 (code, bias) 用于排名变化
@@ -114,16 +205,51 @@ def build_snapshot(
         except Exception:
             continue
 
+        price = m.price
+        change_pct = m.change_pct
+        bias_pct = m.bias_pct
+        quote_time = "-"
+        intraday = False
+        try:
+            quote = ms.fetch_quote(item)
+        except Exception:
+            quote = None
+
+        if quote is not None and np.isfinite(quote["price"]):
+            try:
+                realtime_m = compute_row_metrics(
+                    df,
+                    asof=asof_ts,
+                    realtime_price=quote["price"],
+                    realtime_date=quote["quote_date"],
+                )
+            except Exception:
+                realtime_m = m
+            price = quote["price"]
+            prev_close = quote["prev_close"]
+            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
+            bias_pct = ((price - realtime_m.ma20) / realtime_m.ma20 * 100) if realtime_m.ma20 else 0.0
+            quote_time = quote["display"]
+            intraday = is_market_open(
+                item.source,
+                item.symbol,
+                quote["quote_date"],
+                quote["quote_time"],
+                now_beijing,
+            )
+
         rows.append({
             "代码": item.code, "名称": item.name,
-            "涨幅%": round(m.change_pct, 2),
-            "现价": round(m.price, 2),
+            "报价时间": quote_time,
+            "状态": "盘中" if intraday else "已收盘",
+            "涨幅%": round(change_pct, 2),
+            "现价": round(price, 2),
             "20日均线": round(m.ma20, 2),
-            "偏离率%": round(m.bias_pct, 2),
+            "偏离率%": round(bias_pct, 2),
             "量比": round(m.vol_ratio, 2) if m.vol_ratio is not None else None,
             "状态转变时间": m.state_change_date.date().isoformat() if m.state_change_date is not None else "-",
             "区间涨幅%": round(m.range_pct, 2) if m.range_pct is not None else None,
-            "_bias_raw": m.bias_pct,
+            "_bias_raw": bias_pct,
         })
 
         # 上一交易日快照（用于排名变化）
@@ -156,7 +282,6 @@ def build_snapshot(
     df = pd.DataFrame(rows).sort_values("_bias_raw", ascending=False).reset_index(drop=True)
     df.insert(0, "排序", range(1, len(df) + 1))
     df = df.drop(columns=["_bias_raw"])
-    cols = ["排序", "代码", "名称", "涨幅%", "现价", "20日均线", "偏离率%",
-            "量比", "状态转变时间", "区间涨幅%", "排序变化"]
+    cols = ["排序", "代码", "名称", "报价时间", "涨幅%", "现价", "20日均线", "偏离率%",
+            "量比", "状态转变时间", "区间涨幅%", "排序变化", "状态"]
     return df[cols]
-

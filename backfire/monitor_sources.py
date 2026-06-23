@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+from typing import TypedDict
 
 import pandas as pd
 
@@ -14,6 +16,7 @@ from . import config
 
 config.apply_network_env()
 import akshare as ak  # noqa: E402
+import requests  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,14 @@ class MonitorItem:
     name: str        # 中文名
     source: str      # a_index | us_index | hk_index | global_index | sge_spot
     symbol: str      # 该数据源的实际查询符号
+
+
+class Quote(TypedDict):
+    price: float
+    prev_close: float
+    quote_date: str
+    quote_time: str
+    display: str
 
 
 # 监控清单（对齐图片，按可靠性 curated；取不到的会自动跳过）
@@ -93,3 +104,145 @@ _DISPATCH = {
 def fetch_item(item: MonitorItem) -> pd.DataFrame:
     """抓取单条监控标的的日线历史，标准化返回。"""
     return _DISPATCH[item.source](item.symbol)
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+_GLOBAL_REALTIME_SYMBOLS = {
+    "日经225指数": "znb_NKY",
+    "首尔综合指数": "znb_KOSPI",
+    "中国台湾加权指数": "znb_TWJQ",
+}
+
+
+def _resolve_realtime_symbol(item: MonitorItem) -> str | None:
+    if item.source == "a_index":
+        return item.symbol
+    if item.source == "us_index":
+        return f"gb_${item.symbol.removeprefix('.').lower()}"
+    if item.source == "global_index":
+        return _GLOBAL_REALTIME_SYMBOLS.get(item.symbol)
+    if item.source == "hk_index":
+        return f"rt_hk{item.symbol}"
+    if item.source == "sge_spot":
+        return "gds_AUTD"
+    return None
+
+
+def _normalize_quote_time(date_text: str, time_text: str) -> str | None:
+    date_text = date_text.strip().replace("/", "-")
+    time_text = time_text.strip()
+    if not _DATE_RE.match(date_text) or not _TIME_RE.match(time_text):
+        return None
+    return f"{date_text[5:]} {time_text}"
+
+
+def _to_float(value: str) -> float | None:
+    try:
+        number = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return number if pd.notna(number) else None
+
+
+def _quote_result(price: float | None, prev_close: float | None,
+                  date_text: str, time_text: str) -> Quote | None:
+    if price is None or prev_close is None:
+        return None
+    quote_date = date_text.strip().replace("/", "-")
+    quote_time = time_text.strip()
+    display = _normalize_quote_time(quote_date, quote_time)
+    if display is None:
+        return None
+    return {
+        "price": price,
+        "prev_close": prev_close,
+        "quote_date": quote_date,
+        "quote_time": quote_time,
+        "display": display,
+    }
+
+
+def _extract_quote(source: str, fields: list[str]) -> Quote | None:
+    """按 Sina 实时行情各格式提取报价：price/prev_close/date/time。
+
+    字段表（0-based，GBK payload 逗号切分）：
+    - a_index: price[3], prev_close[2], date[30], time[31]
+    - us_index: price[1], change_amount[4], datetime[3]，prev_close=price-change
+    - global_index: price[1], change_amount[2], date[6], time[7]，prev_close=price-change
+    - hk_index: price[6], prev_close[3], date[17], time[18]
+    - sge_spot: price[0], prev_close[7], date[12], time[6]
+    """
+    try:
+        if source == "a_index":
+            return _quote_result(_to_float(fields[3]), _to_float(fields[2]), fields[30], fields[31])
+
+        if source == "us_index":
+            price = _to_float(fields[1])
+            change_amount = _to_float(fields[4])
+            value = fields[3].strip()
+            if price is None or change_amount is None or not _DATETIME_RE.match(value):
+                return None
+            return _quote_result(price, price - change_amount, value[:10], value[11:])
+
+        if source == "global_index":
+            price = _to_float(fields[1])
+            change_amount = _to_float(fields[2])
+            if price is None or change_amount is None:
+                return None
+            return _quote_result(price, price - change_amount, fields[6], fields[7])
+
+        if source == "hk_index":
+            return _quote_result(_to_float(fields[6]), _to_float(fields[3]), fields[17], fields[18])
+
+        if source == "sge_spot":
+            return _quote_result(_to_float(fields[0]), _to_float(fields[7]), fields[12], fields[6])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _fetch_realtime_fields(item: MonitorItem) -> list[str] | None:
+    realtime_symbol = _resolve_realtime_symbol(item)
+    if not realtime_symbol:
+        return None
+
+    try:
+        r = requests.get(
+            "https://hq.sinajs.cn/list=" + realtime_symbol,
+            timeout=4,
+            headers={"Referer": "https://finance.sina.com.cn"},
+        )
+        if r.status_code != 200 or not r.content:
+            return None
+        text = r.content.decode("gbk", errors="ignore").strip()
+        if not text or '=""' in text or '"' not in text:
+            return None
+        payload = text.split('"', 1)[1].rsplit('"', 1)[0]
+        if not payload:
+            return None
+        return payload.split(",")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _extract_quote_time(source: str, fields: list[str]) -> str | None:
+    """按 Sina 实时行情各格式提取报价时间，返回 MM-DD HH:MM:SS。"""
+    quote = _extract_quote(source, fields)
+    return quote["display"] if quote is not None else None
+
+
+def fetch_quote(item: MonitorItem) -> Quote | None:
+    """抓取 Sina 实时报价；失败返回 None，不影响日线指标计算。"""
+    fields = _fetch_realtime_fields(item)
+    if fields is None:
+        return None
+    return _extract_quote(item.source, fields)
+
+
+def fetch_quote_time(item: MonitorItem) -> str | None:
+    """抓取 Sina 实时报价时间；失败返回 None，不影响日线指标计算。"""
+    quote = fetch_quote(item)
+    return quote["display"] if quote is not None else None
