@@ -1,5 +1,5 @@
 """趋势监控逻辑测试（离线，合成数据）。"""
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -222,6 +222,65 @@ def test_build_snapshot_overlays_realtime_quote(monkeypatch):
     )
 
 
+def test_build_snapshot_overlays_today_quote_when_not_intraday(monkeypatch):
+    """今日报价即使非盘中，也覆盖现价/涨幅/偏离率。"""
+    from backfire import monitor_sources as ms
+
+    item = ms.MonitorItem("AAA", "非盘中", "a_index", "x")
+    daily = _df([10.0] * 20 + [12.0])
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    display = f"{today[5:]} 08:59:57"
+
+    monkeypatch.setattr(ms, "fetch_item", lambda it: daily)
+    monkeypatch.setattr(ms, "fetch_quote", lambda it: {
+        "price": 13.0,
+        "prev_close": 10.0,
+        "quote_date": today,
+        "quote_time": "08:59:57",
+        "display": display,
+    })
+    monkeypatch.setattr(monitor, "is_market_open", lambda *args: False)
+
+    snap = build_snapshot(watchlist=[item])
+    row = snap.iloc[0]
+    assert row["现价"] == 13.0
+    assert row["涨幅%"] == pytest.approx(30.0)
+    assert row["偏离率%"] == pytest.approx(round((13.0 - 10.1) / 10.1 * 100, 2))
+    assert row["报价时间"] == display
+    assert row["状态"] == "已收盘"
+
+
+def test_build_snapshot_keeps_daily_metrics_when_quote_is_stale(monkeypatch):
+    """昨日残留报价只展示报价时间，不覆盖现价/涨幅/偏离率。"""
+    from backfire import monitor_sources as ms
+
+    item = ms.MonitorItem("AAA", "昨日残留", "a_index", "x")
+    daily = _df([10.0] * 20 + [12.0])
+    pure_daily = compute_row_metrics(daily)
+    stale_date = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+    display = f"{stale_date[5:]} 08:59:57"
+
+    monkeypatch.setattr(ms, "fetch_item", lambda it: daily)
+    monkeypatch.setattr(ms, "fetch_quote", lambda it: {
+        "price": 13.0,
+        "prev_close": 10.0,
+        "quote_date": stale_date,
+        "quote_time": "08:59:57",
+        "display": display,
+    })
+    monkeypatch.setattr(monitor, "is_market_open", lambda *args: False)
+
+    snap = build_snapshot(watchlist=[item])
+    row = snap.iloc[0]
+    assert row["现价"] == round(pure_daily.price, 2)
+    assert row["涨幅%"] == round(pure_daily.change_pct, 2)
+    assert row["偏离率%"] == round(pure_daily.bias_pct, 2)
+    assert row["报价时间"] == display
+    assert row["状态"] == "已收盘"
+
+
 def test_build_snapshot_falls_back_when_quote_missing(monkeypatch):
     """实时报价失败时保留原日线口径，报价时间为 '-'，不丢行。"""
     from backfire import monitor_sources as ms
@@ -289,3 +348,12 @@ def test_extract_quote_time_formats():
     assert ms._extract_quote_time("global_index", znb_fields) == "06-23 11:51:15"
     assert ms._extract_quote_time("hk_index", hk_fields) == "06-23 11:51:29"
     assert ms._extract_quote_time("sge_spot", gds_fields) == "06-23 11:51:00"
+
+
+def test_extract_quote_discards_zero_a_index_price():
+    from backfire import monitor_sources as ms
+
+    fields = [""] * 32
+    fields[2], fields[3], fields[30], fields[31] = "3900.00", "0.000", "2026-06-24", "09:20:00"
+
+    assert ms._extract_quote("a_index", fields) is None

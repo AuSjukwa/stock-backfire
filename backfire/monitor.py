@@ -210,12 +210,23 @@ def build_snapshot(
         bias_pct = m.bias_pct
         quote_time = "-"
         intraday = False
+        quote_is_today = False
         try:
             quote = ms.fetch_quote(item)
         except Exception:
             quote = None
 
         if quote is not None and np.isfinite(quote["price"]):
+            quote_is_today = quote["quote_date"] == now_beijing.date().isoformat()
+            quote_time = quote["display"]
+            intraday = is_market_open(
+                item.source,
+                item.symbol,
+                quote["quote_date"],
+                quote["quote_time"],
+                now_beijing,
+            )
+        if quote is not None and np.isfinite(quote["price"]) and quote_is_today:
             try:
                 realtime_m = compute_row_metrics(
                     df,
@@ -229,14 +240,6 @@ def build_snapshot(
             prev_close = quote["prev_close"]
             change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0.0
             bias_pct = ((price - realtime_m.ma20) / realtime_m.ma20 * 100) if realtime_m.ma20 else 0.0
-            quote_time = quote["display"]
-            intraday = is_market_open(
-                item.source,
-                item.symbol,
-                quote["quote_date"],
-                quote["quote_time"],
-                now_beijing,
-            )
 
         rows.append({
             "代码": item.code, "名称": item.name,

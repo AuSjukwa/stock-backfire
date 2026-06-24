@@ -149,7 +149,7 @@ def _to_float(value: str) -> float | None:
 
 def _quote_result(price: float | None, prev_close: float | None,
                   date_text: str, time_text: str) -> Quote | None:
-    if price is None or prev_close is None:
+    if price is None or prev_close is None or price <= 0:
         return None
     quote_date = date_text.strip().replace("/", "-")
     quote_time = time_text.strip()
