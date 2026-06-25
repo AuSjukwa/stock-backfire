@@ -199,6 +199,8 @@ def test_build_snapshot_overlays_realtime_quote(monkeypatch):
 
     monkeypatch.setattr(ms, "fetch_item", lambda it: data[it.symbol])
     monkeypatch.setattr(ms, "fetch_quote", quote)
+    monkeypatch.setattr(monitor, "has_opened_today", lambda *args: True)
+    monkeypatch.setattr(monitor, "has_closed_today", lambda *args: False, raising=False)
 
     snap = build_snapshot(watchlist=items)
     row = snap[snap["代码"] == "AAA"].iloc[0]
@@ -240,6 +242,8 @@ def test_build_snapshot_overlays_today_quote_when_not_intraday(monkeypatch):
         "display": display,
     })
     monkeypatch.setattr(monitor, "is_market_open", lambda *args: False)
+    monkeypatch.setattr(monitor, "has_opened_today", lambda *args: True)
+    monkeypatch.setattr(monitor, "has_closed_today", lambda *args: True, raising=False)
 
     snap = build_snapshot(watchlist=[item])
     row = snap.iloc[0]
@@ -281,6 +285,46 @@ def test_build_snapshot_keeps_daily_metrics_when_quote_is_stale(monkeypatch):
     assert row["状态"] == "已收盘"
 
 
+def test_build_snapshot_three_statuses(monkeypatch):
+    from backfire import monitor_sources as ms
+
+    items = [
+        ms.MonitorItem("PRE", "盘前", "a_index", "pre"),
+        ms.MonitorItem("MID", "午休", "a_index", "mid"),
+        ms.MonitorItem("END", "收盘后", "a_index", "end"),
+        ms.MonitorItem("OLD", "非今日", "a_index", "old"),
+    ]
+    daily = _df([10.0] * 20 + [12.0])
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    stale_date = (
+        datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+    ).isoformat()
+
+    def quote(it):
+        quote_date = stale_date if it.symbol == "old" else today
+        return {
+            "price": 13.0,
+            "prev_close": 10.0,
+            "quote_date": quote_date,
+            "quote_time": "12:00:00",
+            "display": f"{quote_date[5:]} 12:00:00",
+        }
+
+    monkeypatch.setattr(ms, "fetch_item", lambda it: daily)
+    monkeypatch.setattr(ms, "fetch_quote", quote)
+    monkeypatch.setattr(monitor, "has_opened_today", lambda source, symbol, now: symbol != "pre")
+    monkeypatch.setattr(monitor, "has_closed_today", lambda source, symbol, now: symbol == "end", raising=False)
+    monkeypatch.setattr(monitor, "is_market_open", lambda *args: True)
+
+    snap = build_snapshot(watchlist=items)
+    statuses = dict(zip(snap["代码"], snap["状态"]))
+
+    assert statuses["PRE"] == "未开盘"
+    assert statuses["MID"] == "盘中"
+    assert statuses["END"] == "已收盘"
+    assert statuses["OLD"] == "已收盘"
+
+
 def test_build_snapshot_falls_back_when_quote_missing(monkeypatch):
     """实时报价失败时保留原日线口径，报价时间为 '-'，不丢行。"""
     from backfire import monitor_sources as ms
@@ -306,6 +350,22 @@ def test_is_market_open_a_index_sessions():
     assert monitor.is_market_open("a_index", "sh000300", "2026-06-23", "12:00:00", now) is False
     assert monitor.is_market_open("a_index", "sh000300", "2026-06-23", "15:30:00", now) is False
     assert monitor.is_market_open("a_index", "sh000300", "2026-06-22", "10:00:00", now) is False
+
+
+def test_has_opened_today_a_index():
+    tz = monitor.BEIJING_TZ
+
+    assert monitor.has_opened_today("a_index", "sh000300", datetime(2026, 6, 23, 9, 0, tzinfo=tz)) is False
+    assert monitor.has_opened_today("a_index", "sh000300", datetime(2026, 6, 23, 12, 0, tzinfo=tz)) is True
+    assert monitor.has_opened_today("a_index", "sh000300", datetime(2026, 6, 23, 15, 30, tzinfo=tz)) is True
+
+
+def test_has_closed_today_a_index():
+    tz = monitor.BEIJING_TZ
+
+    assert monitor.has_closed_today("a_index", "sh000300", datetime(2026, 6, 23, 9, 0, tzinfo=tz)) is False
+    assert monitor.has_closed_today("a_index", "sh000300", datetime(2026, 6, 23, 12, 0, tzinfo=tz)) is False
+    assert monitor.has_closed_today("a_index", "sh000300", datetime(2026, 6, 23, 15, 30, tzinfo=tz)) is True
 
 
 def test_is_market_open_global_index_sessions():

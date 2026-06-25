@@ -112,6 +112,46 @@ def is_market_open(
     return _time_in_windows(quote_dt.time(), windows)
 
 
+def has_opened_today(source: str, item_symbol: str, now_beijing: datetime) -> bool:
+    current_beijing = (
+        now_beijing.replace(tzinfo=BEIJING_TZ)
+        if now_beijing.tzinfo is None
+        else now_beijing.astimezone(BEIJING_TZ)
+    )
+    if source == "us_index":
+        et = current_beijing.astimezone(US_EASTERN_TZ)
+        return et.weekday() < 5 and et.time() >= time(9, 30)
+    windows = (
+        _GLOBAL_INDEX_WINDOWS_BEIJING.get(item_symbol, [])
+        if source == "global_index"
+        else _MARKET_WINDOWS_BEIJING.get(source, [])
+    )
+    if not windows:
+        return False
+    first_start = min(start for start, _ in windows)
+    return current_beijing.time() >= first_start
+
+
+def has_closed_today(source: str, item_symbol: str, now_beijing: datetime) -> bool:
+    current_beijing = (
+        now_beijing.replace(tzinfo=BEIJING_TZ)
+        if now_beijing.tzinfo is None
+        else now_beijing.astimezone(BEIJING_TZ)
+    )
+    if source == "us_index":
+        et = current_beijing.astimezone(US_EASTERN_TZ)
+        return et.weekday() >= 5 or et.time() >= time(16, 0)
+    windows = (
+        _GLOBAL_INDEX_WINDOWS_BEIJING.get(item_symbol, [])
+        if source == "global_index"
+        else _MARKET_WINDOWS_BEIJING.get(source, [])
+    )
+    if not windows:
+        return False
+    last_end = max(end for _, end in windows)
+    return current_beijing.time() >= last_end
+
+
 def compute_row_metrics(df: pd.DataFrame, asof: pd.Timestamp | None = None,
                         ma_window: int = MA_WINDOW, vol_window: int = VOL_WINDOW,
                         realtime_price: float | None = None,
@@ -209,8 +249,8 @@ def build_snapshot(
         change_pct = m.change_pct
         bias_pct = m.bias_pct
         quote_time = "-"
-        intraday = False
         quote_is_today = False
+        status = "已收盘"
         try:
             quote = ms.fetch_quote(item)
         except Exception:
@@ -219,14 +259,19 @@ def build_snapshot(
         if quote is not None and np.isfinite(quote["price"]):
             quote_is_today = quote["quote_date"] == now_beijing.date().isoformat()
             quote_time = quote["display"]
-            intraday = is_market_open(
-                item.source,
-                item.symbol,
-                quote["quote_date"],
-                quote["quote_time"],
-                now_beijing,
-            )
-        if quote is not None and np.isfinite(quote["price"]) and quote_is_today:
+            if quote_is_today:
+                if not has_opened_today(item.source, item.symbol, now_beijing):
+                    status = "未开盘"
+                elif has_closed_today(item.source, item.symbol, now_beijing):
+                    status = "已收盘"
+                else:
+                    status = "盘中"
+        if (
+            quote is not None
+            and np.isfinite(quote["price"])
+            and quote_is_today
+            and has_opened_today(item.source, item.symbol, now_beijing)
+        ):
             try:
                 realtime_m = compute_row_metrics(
                     df,
@@ -244,7 +289,7 @@ def build_snapshot(
         rows.append({
             "代码": item.code, "名称": item.name,
             "报价时间": quote_time,
-            "状态": "盘中" if intraday else "已收盘",
+            "状态": status,
             "涨幅%": round(change_pct, 2),
             "现价": round(price, 2),
             "20日均线": round(m.ma20, 2),
